@@ -446,6 +446,11 @@ impl<'a> Checker<'a> {
         }
     }
 
+    #[cfg_attr(not(feature = "ext-lint"), allow(dead_code))]
+    pub(crate) fn source_file(&self) -> SourceFile {
+        self.context.source_file()
+    }
+
     /// The [`Locator`] for the current file, which enables extraction of source code from byte
     /// offsets.
     pub(crate) const fn locator(&self) -> &'a Locator<'a> {
@@ -3349,6 +3354,10 @@ impl<'a> LintContext<'a> {
         }
     }
 
+    pub(crate) fn source_file(&self) -> SourceFile {
+        self.source_file.clone()
+    }
+
     /// Return a [`DiagnosticGuard`] for reporting a diagnostic.
     ///
     /// The guard derefs to a [`Diagnostic`], so it can be used to further modify the diagnostic
@@ -3420,11 +3429,6 @@ impl<'a> LintContext<'a> {
     /// The [`LinterSettings`] for the current analysis, including the enabled rules.
     pub(crate) const fn settings(&self) -> &LinterSettings {
         self.settings
-    }
-
-    #[cfg(any(feature = "test-rules", test))]
-    pub(crate) const fn source_file(&self) -> &SourceFile {
-        &self.source_file
     }
 }
 
