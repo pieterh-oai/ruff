@@ -27,12 +27,15 @@ use pyo3::conversion::IntoPyObject;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyList, PyModule};
 use ruff_cache::{CacheKey, CacheKeyHasher};
-use ruff_python_ast::name::UnqualifiedName;
+use ruff_python_ast::name::{QualifiedName, UnqualifiedName};
 use ruff_python_ast::{Expr, Stmt};
+use ruff_python_semantic::NodeId;
 use ruff_source_file::SourceFile;
 use ruff_text_size::{Ranged, TextRange};
 use rustc_hash::{FxHashMap, FxHashSet};
 use toml::value::{Table as TomlTable, Value as TomlValue};
+
+pub(crate) use semantic::SemanticModelView;
 
 thread_local! {
     static RUNTIME_CACHE: RefCell<FxHashMap<u64, RegistryRuntime>> =
@@ -189,7 +192,10 @@ impl ExternalLintRuntime {
                                             &config,
                                             rule,
                                             node.range(),
+                                            checker,
                                         )?;
+                                        let _semantic_handle =
+                                            SemanticHandle::new(&runtime_context, py);
                                         let outcome = callback
                                             .call1(py, (py_node, runtime_context.context(py)));
                                         runtime_context.flush(py, checker);
@@ -458,6 +464,25 @@ fn lookup_callable(module: &Bound<'_, PyModule>, name: &str) -> Option<Py<PyAny>
 struct RuntimeContext {
     context: PyObject,
     reporter: Py<PyReporter>,
+    semantic: Py<SemanticModelView>,
+}
+
+/// Ensures the semantic model is deactivated even if a callback unwinds early.
+struct SemanticHandle<'py> {
+    py: Python<'py>,
+    context: &'py RuntimeContext,
+}
+
+impl<'py> SemanticHandle<'py> {
+    fn new(context: &'py RuntimeContext, py: Python<'py>) -> Self {
+        Self { py, context }
+    }
+}
+
+impl Drop for SemanticHandle<'_> {
+    fn drop(&mut self) {
+        self.context.deactivate_semantic(self.py);
+    }
 }
 
 impl RuntimeContext {
@@ -468,6 +493,11 @@ impl RuntimeContext {
     fn flush(&self, py: Python<'_>, checker: &Checker<'_>) {
         let reporter = self.reporter.bind(py);
         reporter.borrow().drain_into(checker);
+    }
+
+    fn deactivate_semantic(&self, py: Python<'_>) {
+        let bound = self.semantic.bind(py);
+        bound.borrow().deactivate();
     }
 }
 
@@ -515,14 +545,20 @@ impl Drop for ExternalCheckerContext {
     }
 }
 
+fn node_ids_to_u32(ids: impl Iterator<Item = NodeId>) -> Vec<u32> {
+    ids.map(NodeId::as_u32).collect()
+}
+
 fn build_context(
     py: Python<'_>,
     module_types: &ModuleTypes,
     config: &PyObject,
     rule: &crate::external::ast::rule::ExternalAstRule,
     range: TextRange,
+    checker: &Checker<'_>,
 ) -> PyResult<RuntimeContext> {
     let reporter = PyReporter::new(py, rule, range)?;
+    let semantic = SemanticModelView::new(py, checker, module_types.projection)?;
     let context = module_types
         .context
         .bind(py)
@@ -531,10 +567,15 @@ fn build_context(
             rule.name.as_str(),
             config.clone_ref(py),
             reporter.clone_ref(py),
+            semantic.clone_ref(py),
         ))?
         .into();
 
-    Ok(RuntimeContext { context, reporter })
+    Ok(RuntimeContext {
+        context,
+        reporter,
+        semantic,
+    })
 }
 
 fn config_to_python(
@@ -802,6 +843,858 @@ mod tests {
                 );
             }
             other => panic!("unexpected error: {other:?}"),
+        }
+    }
+}
+
+pub(crate) mod semantic {
+    use super::*;
+    use crate::checkers::ast::Checker;
+    use crate::external::ast::python::node_handle;
+    use pyo3::exceptions::{PyRuntimeError, PyValueError};
+    use ruff_python_ast::{Expr, ExprContext, HasNodeIndex};
+    use ruff_python_semantic::{
+        BindingId, BindingKind, ExecutionContext, GeneratorKind, Modules, NodeId,
+        ResolvedReference, ResolvedReferenceId, Scope, ScopeId, ScopeKind,
+    };
+    use std::cell::Cell;
+
+    #[pyclass(module = "ruff_external", name = "SemanticModel", unsendable)]
+    pub(crate) struct SemanticModelView {
+        state: SemanticState,
+        projection: ProjectionTypesRef,
+    }
+
+    impl SemanticModelView {
+        pub(crate) fn new(
+            py: Python<'_>,
+            checker: &Checker<'_>,
+            projection: ProjectionTypesRef,
+        ) -> PyResult<Py<Self>> {
+            Py::new(
+                py,
+                SemanticModelView {
+                    state: SemanticState::new(checker),
+                    projection,
+                },
+            )
+        }
+
+        pub(crate) fn deactivate(&self) {
+            self.state.deactivate();
+        }
+
+        fn with_checker<R>(&self, f: impl FnOnce(&Checker<'_>) -> PyResult<R>) -> PyResult<R> {
+            self.state.with_checker(f)
+        }
+    }
+
+    #[pymethods]
+    impl SemanticModelView {
+        fn resolve_name(&self, node: &Bound<'_, PyAny>) -> PyResult<Option<String>> {
+            let node_id = node_id(node)?;
+            self.with_checker(|checker| Ok(resolve_name_string(checker, node_id)))
+        }
+
+        fn resolve_binding(&self, node: &Bound<'_, PyAny>) -> PyResult<Option<PyBinding>> {
+            let node_id = node_id(node)?;
+            self.with_checker(|checker| Ok(resolve_name_binding(checker, node_id)))
+        }
+
+        fn only_binding(&self, node: &Bound<'_, PyAny>) -> PyResult<Option<PyBinding>> {
+            let node_id = node_id(node)?;
+            self.with_checker(|checker| {
+                let semantic = checker.semantic();
+                let binding = match semantic.node(node_id).as_expression() {
+                    Some(Expr::Name(name)) => semantic.only_binding(name),
+                    _ => None,
+                };
+                Ok(binding.map(|binding_id| PyBinding::new(checker, binding_id)))
+            })
+        }
+
+        fn resolve_qualified_name(&self, node: &Bound<'_, PyAny>) -> PyResult<Option<String>> {
+            let node_id = node_id(node)?;
+            self.with_checker(|checker| {
+                let semantic = checker.semantic();
+                let qualified = semantic
+                    .node(node_id)
+                    .as_expression()
+                    .and_then(|expr| semantic.resolve_qualified_name(expr))
+                    .map(|value| value.to_string());
+                Ok(qualified)
+            })
+        }
+
+        fn lookup_attribute(&self, node: &Bound<'_, PyAny>) -> PyResult<Option<PyBinding>> {
+            let node_id = node_id(node)?;
+            self.with_checker(|checker| {
+                let semantic = checker.semantic();
+                let binding = semantic
+                    .node(node_id)
+                    .as_expression()
+                    .and_then(|expr| semantic.lookup_attribute(expr));
+                Ok(binding.map(|binding_id| PyBinding::new(checker, binding_id)))
+            })
+        }
+
+        fn resolve_qualified_import_name(
+            &self,
+            module: &str,
+            member: &str,
+        ) -> PyResult<Option<String>> {
+            self.with_checker(|checker| {
+                Ok(checker
+                    .semantic()
+                    .resolve_qualified_import_name(module, member)
+                    .map(|imported| imported.into_name()))
+            })
+        }
+
+        fn current_statement<'py>(&self, py: Python<'py>) -> PyResult<PyObject> {
+            self.with_checker(|checker| {
+                stmt_to_python(
+                    py,
+                    checker.locator(),
+                    checker.semantic().current_statement(),
+                    &self.projection,
+                )
+            })
+        }
+
+        fn current_statement_parent<'py>(&self, py: Python<'py>) -> PyResult<Option<PyObject>> {
+            self.with_checker(|checker| {
+                checker
+                    .semantic()
+                    .current_statement_parent()
+                    .map(|stmt| stmt_to_python(py, checker.locator(), stmt, &self.projection))
+                    .transpose()
+            })
+        }
+
+        fn current_statements<'py>(&self, py: Python<'py>) -> PyResult<Vec<PyObject>> {
+            self.with_checker(|checker| {
+                checker
+                    .semantic()
+                    .current_statements()
+                    .map(|stmt| stmt_to_python(py, checker.locator(), stmt, &self.projection))
+                    .collect()
+            })
+        }
+
+        fn current_statement_id(&self) -> PyResult<Option<u32>> {
+            self.with_checker(|checker| {
+                Ok(checker
+                    .semantic()
+                    .current_statement_id()
+                    .map(|id| id.as_u32()))
+            })
+        }
+
+        fn current_statement_parent_id(&self) -> PyResult<Option<u32>> {
+            self.with_checker(|checker| {
+                Ok(checker
+                    .semantic()
+                    .current_statement_parent_id()
+                    .map(|id| id.as_u32()))
+            })
+        }
+
+        fn current_statement_ids(&self) -> PyResult<Vec<u32>> {
+            self.with_checker(|checker| {
+                Ok(node_ids_to_u32(checker.semantic().current_statement_ids()))
+            })
+        }
+
+        fn parent_statement<'py>(
+            &self,
+            node: &Bound<'_, PyAny>,
+            py: Python<'py>,
+        ) -> PyResult<Option<PyObject>> {
+            let node_id = node_id(node)?;
+            self.with_checker(|checker| {
+                checker
+                    .semantic()
+                    .parent_statement(node_id)
+                    .map(|stmt| stmt_to_python(py, checker.locator(), stmt, &self.projection))
+                    .transpose()
+            })
+        }
+
+        fn parent_statement_id(&self, node: &Bound<'_, PyAny>) -> PyResult<Option<u32>> {
+            let node_id = node_id(node)?;
+            self.with_checker(|checker| {
+                Ok(checker
+                    .semantic()
+                    .parent_statement_id(node_id)
+                    .map(|id| id.as_u32()))
+            })
+        }
+
+        fn same_branch(&self, left: &Bound<'_, PyAny>, right: &Bound<'_, PyAny>) -> PyResult<bool> {
+            let left_id = node_id(left)?;
+            let right_id = node_id(right)?;
+            self.with_checker(|checker| Ok(checker.semantic().same_branch(left_id, right_id)))
+        }
+
+        fn dominates(&self, left: &Bound<'_, PyAny>, right: &Bound<'_, PyAny>) -> PyResult<bool> {
+            let left_id = node_id(left)?;
+            let right_id = node_id(right)?;
+            self.with_checker(|checker| Ok(checker.semantic().dominates(left_id, right_id)))
+        }
+
+        fn current_expression<'py>(&self, py: Python<'py>) -> PyResult<Option<PyObject>> {
+            self.with_checker(|checker| {
+                checker
+                    .semantic()
+                    .current_expression()
+                    .map(|expr| expr_to_python(py, checker.locator(), expr, &self.projection))
+                    .transpose()
+            })
+        }
+
+        fn current_expression_parent<'py>(&self, py: Python<'py>) -> PyResult<Option<PyObject>> {
+            self.with_checker(|checker| {
+                checker
+                    .semantic()
+                    .current_expression_parent()
+                    .map(|expr| expr_to_python(py, checker.locator(), expr, &self.projection))
+                    .transpose()
+            })
+        }
+
+        fn current_expression_grandparent<'py>(
+            &self,
+            py: Python<'py>,
+        ) -> PyResult<Option<PyObject>> {
+            self.with_checker(|checker| {
+                checker
+                    .semantic()
+                    .current_expression_grandparent()
+                    .map(|expr| expr_to_python(py, checker.locator(), expr, &self.projection))
+                    .transpose()
+            })
+        }
+
+        fn current_expressions<'py>(&self, py: Python<'py>) -> PyResult<Vec<PyObject>> {
+            self.with_checker(|checker| {
+                checker
+                    .semantic()
+                    .current_expressions()
+                    .map(|expr| expr_to_python(py, checker.locator(), expr, &self.projection))
+                    .collect()
+            })
+        }
+
+        fn global_declaration(&self, name: &str) -> PyResult<Option<(u32, u32)>> {
+            if name.is_empty() {
+                return Err(PyValueError::new_err("name must be non-empty"));
+            }
+            self.with_checker(|checker| {
+                Ok(checker
+                    .semantic()
+                    .global(name)
+                    .map(|range| (range.start().to_u32(), range.end().to_u32())))
+            })
+        }
+
+        fn resolve_nonlocal(&self, name: &str) -> PyResult<Option<(PyScopeHandle, PyBinding)>> {
+            if name.is_empty() {
+                return Err(PyValueError::new_err("name must be non-empty"));
+            }
+            self.with_checker(|checker| {
+                let semantic = checker.semantic();
+                Ok(semantic.nonlocal(name).map(|(scope_id, binding_id)| {
+                    (
+                        PyScopeHandle::new(scope_id, &semantic.scopes[scope_id]),
+                        PyBinding::new(checker, binding_id),
+                    )
+                }))
+            })
+        }
+
+        fn shadowed_binding(&self, node: &Bound<'_, PyAny>) -> PyResult<Option<PyBinding>> {
+            let node_id = node_id(node)?;
+            self.with_checker(|checker| {
+                let Some(binding_id) = resolve_binding_id(checker, node_id) else {
+                    return Ok(None);
+                };
+                Ok(checker
+                    .semantic()
+                    .shadowed_binding(binding_id)
+                    .map(|shadowed_id| PyBinding::new(checker, shadowed_id)))
+            })
+        }
+
+        fn shadowed_bindings(
+            &self,
+            node: &Bound<'_, PyAny>,
+        ) -> PyResult<Vec<(PyBinding, PyBinding, bool)>> {
+            let node_id = node_id(node)?;
+            self.with_checker(|checker| {
+                let Some(binding_id) = resolve_binding_id(checker, node_id) else {
+                    return Ok(Vec::new());
+                };
+                let semantic = checker.semantic();
+                let scope_id = semantic.binding(binding_id).scope;
+                Ok(semantic
+                    .shadowed_bindings(scope_id, binding_id)
+                    .map(|shadow| {
+                        (
+                            PyBinding::new(checker, shadow.binding_id()),
+                            PyBinding::new(checker, shadow.shadowed_id()),
+                            shadow.same_scope(),
+                        )
+                    })
+                    .collect())
+            })
+        }
+
+        fn at_top_level(&self) -> PyResult<bool> {
+            self.with_checker(|checker| Ok(checker.semantic().at_top_level()))
+        }
+
+        fn in_async_context(&self) -> PyResult<bool> {
+            self.with_checker(|checker| Ok(checker.semantic().in_async_context()))
+        }
+
+        fn in_nested_union(&self) -> PyResult<bool> {
+            self.with_checker(|checker| Ok(checker.semantic().in_nested_union()))
+        }
+
+        fn inside_optional(&self) -> PyResult<bool> {
+            self.with_checker(|checker| Ok(checker.semantic().inside_optional()))
+        }
+
+        fn in_nested_literal(&self) -> PyResult<bool> {
+            self.with_checker(|checker| Ok(checker.semantic().in_nested_literal()))
+        }
+
+        fn current_scope(&self) -> PyResult<PyScopeHandle> {
+            self.with_checker(|checker| {
+                let semantic = checker.semantic();
+                Ok(PyScopeHandle::new(
+                    semantic.scope_id,
+                    semantic.current_scope(),
+                ))
+            })
+        }
+
+        fn current_scope_id(&self) -> PyResult<u32> {
+            self.with_checker(|checker| Ok(checker.semantic().scope_id.as_u32()))
+        }
+
+        fn current_scope_ids(&self) -> PyResult<Vec<u32>> {
+            self.with_checker(|checker| {
+                Ok(checker
+                    .semantic()
+                    .current_scope_ids()
+                    .map(|scope_id| scope_id.as_u32())
+                    .collect())
+            })
+        }
+
+        fn current_scopes(&self) -> PyResult<Vec<PyScopeHandle>> {
+            self.with_checker(|checker| {
+                let semantic = checker.semantic();
+                Ok(semantic
+                    .current_scope_ids()
+                    .map(|scope_id| PyScopeHandle::new(scope_id, &semantic.scopes[scope_id]))
+                    .collect())
+            })
+        }
+
+        fn first_non_type_parent_scope(&self) -> PyResult<Option<PyScopeHandle>> {
+            self.with_checker(|checker| {
+                let semantic = checker.semantic();
+                let parent_id = semantic.first_non_type_parent_scope_id(semantic.scope_id);
+                Ok(parent_id
+                    .map(|scope_id| PyScopeHandle::new(scope_id, &semantic.scopes[scope_id])))
+            })
+        }
+
+        fn first_non_type_parent_scope_id(&self) -> PyResult<Option<u32>> {
+            self.with_checker(|checker| {
+                let semantic = checker.semantic();
+                Ok(semantic
+                    .first_non_type_parent_scope_id(semantic.scope_id)
+                    .map(|scope_id| scope_id.as_u32()))
+            })
+        }
+
+        fn match_builtin_expr(&self, node: &Bound<'_, PyAny>, name: &str) -> PyResult<bool> {
+            let node_id = node_id(node)?;
+            self.with_checker(|checker| {
+                Ok(match checker.semantic().node(node_id).as_expression() {
+                    Some(expr) => checker.semantic().match_builtin_expr(expr, name),
+                    None => false,
+                })
+            })
+        }
+
+        fn resolve_builtin_symbol(&self, node: &Bound<'_, PyAny>) -> PyResult<Option<String>> {
+            let node_id = node_id(node)?;
+            self.with_checker(|checker| {
+                Ok(checker
+                    .semantic()
+                    .node(node_id)
+                    .as_expression()
+                    .and_then(|expr| checker.semantic().resolve_builtin_symbol(expr))
+                    .map(ToString::to_string))
+            })
+        }
+
+        fn match_typing_expr(&self, node: &Bound<'_, PyAny>, name: &str) -> PyResult<bool> {
+            let node_id = node_id(node)?;
+            self.with_checker(|checker| {
+                Ok(match checker.semantic().node(node_id).as_expression() {
+                    Some(expr) => checker.semantic().match_typing_expr(expr, name),
+                    None => false,
+                })
+            })
+        }
+
+        fn match_typing_qualified_name(
+            &self,
+            qualified_name: &str,
+            target: &str,
+        ) -> PyResult<bool> {
+            if qualified_name.is_empty() || target.is_empty() {
+                return Err(PyValueError::new_err(
+                    "qualified_name and target must be non-empty",
+                ));
+            }
+            self.with_checker(|checker| {
+                let qualified = QualifiedName::from_dotted_name(qualified_name);
+                Ok(checker
+                    .semantic()
+                    .match_typing_qualified_name(&qualified, target))
+            })
+        }
+
+        fn seen_typing(&self) -> PyResult<bool> {
+            self.with_checker(|checker| Ok(checker.semantic().seen_typing()))
+        }
+
+        fn in_annotation(&self) -> PyResult<bool> {
+            self.with_checker(|checker| Ok(checker.semantic().in_annotation()))
+        }
+
+        fn in_forward_reference(&self) -> PyResult<bool> {
+            self.with_checker(|checker| Ok(checker.semantic().in_forward_reference()))
+        }
+
+        fn seen_module(&self, name: &str) -> PyResult<bool> {
+            self.with_checker(|checker| {
+                Ok(module_from_name(name)
+                    .map(|module| checker.semantic().seen_module(module))
+                    .unwrap_or(false))
+            })
+        }
+
+        fn has_builtin_binding(&self, name: &str) -> PyResult<bool> {
+            self.with_checker(|checker| Ok(checker.semantic().has_builtin_binding(name)))
+        }
+
+        fn execution_context(&self) -> PyResult<&'static str> {
+            self.with_checker(|checker| {
+                Ok(match checker.semantic().execution_context() {
+                    ExecutionContext::Runtime => "runtime",
+                    ExecutionContext::Typing => "typing",
+                })
+            })
+        }
+
+        fn in_typing_only_annotation(&self) -> PyResult<bool> {
+            self.with_checker(|checker| Ok(checker.semantic().in_typing_only_annotation()))
+        }
+
+        fn __repr__(&self) -> PyResult<String> {
+            Ok("SemanticModel(active=true)".to_string())
+        }
+    }
+
+    #[pyclass(module = "ruff_external", name = "Binding", unsendable)]
+    pub(crate) struct PyBinding {
+        #[pyo3(get)]
+        id: u32,
+        #[pyo3(get)]
+        name: String,
+        #[pyo3(get)]
+        kind: String,
+        #[pyo3(get)]
+        range: (u32, u32),
+        #[pyo3(get)]
+        scope_id: u32,
+        #[pyo3(get)]
+        context: String,
+        #[pyo3(get)]
+        is_global: bool,
+        #[pyo3(get)]
+        is_nonlocal: bool,
+        #[pyo3(get)]
+        is_builtin: bool,
+        #[pyo3(get)]
+        is_used: bool,
+        #[pyo3(get)]
+        is_alias: bool,
+        #[pyo3(get)]
+        is_external: bool,
+        #[pyo3(get)]
+        is_explicit_export: bool,
+        #[pyo3(get)]
+        is_type_alias: bool,
+        #[pyo3(get)]
+        is_unbound: bool,
+        #[pyo3(get)]
+        is_unpacked_assignment: bool,
+        #[pyo3(get)]
+        is_private: bool,
+        #[pyo3(get)]
+        in_exception_handler: bool,
+        #[pyo3(get)]
+        in_assert_statement: bool,
+    }
+
+    impl PyBinding {
+        fn new(checker: &Checker<'_>, binding_id: BindingId) -> Self {
+            let semantic = checker.semantic();
+            let binding = semantic.binding(binding_id);
+            let name = binding.name(checker.source()).to_string();
+            let range = (binding.range.start().to_u32(), binding.range.end().to_u32());
+            PyBinding {
+                id: binding_id.as_u32(),
+                name,
+                kind: binding_kind_name(&binding.kind).to_string(),
+                range,
+                scope_id: binding.scope.as_u32(),
+                context: match binding.context {
+                    ExecutionContext::Runtime => "runtime",
+                    ExecutionContext::Typing => "typing",
+                }
+                .to_string(),
+                is_global: binding.is_global(),
+                is_nonlocal: binding.is_nonlocal(),
+                is_builtin: matches!(binding.kind, BindingKind::Builtin),
+                is_used: binding.is_used(),
+                is_alias: binding.is_alias(),
+                is_external: binding.is_external(),
+                is_explicit_export: binding.is_explicit_export(),
+                is_type_alias: binding.is_type_alias(),
+                is_unbound: binding.is_unbound(),
+                is_unpacked_assignment: binding.is_unpacked_assignment(),
+                is_private: binding.is_private_declaration(),
+                in_exception_handler: binding.in_exception_handler(),
+                in_assert_statement: binding.in_assert_statement(),
+            }
+        }
+
+        fn binding_id(&self) -> BindingId {
+            BindingId::from_u32(self.id)
+        }
+    }
+
+    #[pymethods]
+    impl PyBinding {
+        fn statement<'py>(
+            &self,
+            py: Python<'py>,
+            semantic: &SemanticModelView,
+        ) -> PyResult<Option<PyObject>> {
+            semantic.with_checker(|checker| {
+                let semantic_model = checker.semantic();
+                let binding = semantic_model.binding(self.binding_id());
+                let Some(stmt) = binding.statement(semantic_model) else {
+                    return Ok(None);
+                };
+                stmt_to_python(py, checker.locator(), stmt, &semantic.projection).map(Some)
+            })
+        }
+
+        fn expression<'py>(
+            &self,
+            py: Python<'py>,
+            semantic: &SemanticModelView,
+        ) -> PyResult<Option<PyObject>> {
+            semantic.with_checker(|checker| {
+                let semantic_model = checker.semantic();
+                let binding = semantic_model.binding(self.binding_id());
+                let Some(expr) = binding.expression(semantic_model) else {
+                    return Ok(None);
+                };
+                expr_to_python(py, checker.locator(), expr, &semantic.projection).map(Some)
+            })
+        }
+
+        fn references(&self, semantic: &SemanticModelView) -> PyResult<Vec<PyReference>> {
+            semantic.with_checker(|checker| {
+                let semantic_model = checker.semantic();
+                let binding = semantic_model.binding(self.binding_id());
+                Ok(binding
+                    .references()
+                    .map(|reference_id| {
+                        let reference = semantic_model.reference(reference_id);
+                        PyReference::new(reference_id, reference)
+                    })
+                    .collect())
+            })
+        }
+    }
+
+    #[pyclass(module = "ruff_external", name = "Reference", unsendable)]
+    pub(crate) struct PyReference {
+        #[pyo3(get)]
+        id: u32,
+        #[pyo3(get)]
+        range: (u32, u32),
+        #[pyo3(get)]
+        node_id: Option<u32>,
+        #[pyo3(get)]
+        scope_id: u32,
+        #[pyo3(get)]
+        is_load: bool,
+        #[pyo3(get)]
+        in_typing_context: bool,
+        #[pyo3(get)]
+        in_runtime_context: bool,
+        #[pyo3(get)]
+        in_typing_only_annotation: bool,
+        #[pyo3(get)]
+        in_runtime_evaluated_annotation: bool,
+        #[pyo3(get)]
+        in_type_definition: bool,
+        #[pyo3(get)]
+        in_type_checking_block: bool,
+        #[pyo3(get)]
+        in_string_type_definition: bool,
+        #[pyo3(get)]
+        in_dunder_all_definition: bool,
+        #[pyo3(get)]
+        in_annotated_type_alias_value: bool,
+        #[pyo3(get)]
+        in_assert_statement: bool,
+    }
+
+    impl PyReference {
+        fn new(reference_id: ResolvedReferenceId, reference: &ResolvedReference) -> Self {
+            PyReference {
+                id: reference_id.as_u32(),
+                range: (reference.start().to_u32(), reference.end().to_u32()),
+                node_id: reference.expression_id().map(|node_id| node_id.as_u32()),
+                scope_id: reference.scope_id().as_u32(),
+                is_load: reference.is_load(),
+                in_typing_context: reference.in_typing_context(),
+                in_runtime_context: reference.in_runtime_context(),
+                in_typing_only_annotation: reference.in_typing_only_annotation(),
+                in_runtime_evaluated_annotation: reference.in_runtime_evaluated_annotation(),
+                in_type_definition: reference.in_type_definition(),
+                in_type_checking_block: reference.in_type_checking_block(),
+                in_string_type_definition: reference.in_string_type_definition(),
+                in_dunder_all_definition: reference.in_dunder_all_definition(),
+                in_annotated_type_alias_value: reference.in_annotated_type_alias_value(),
+                in_assert_statement: reference.in_assert_statement(),
+            }
+        }
+    }
+
+    #[pyclass(module = "ruff_external", name = "ScopeHandle", unsendable)]
+    pub(crate) struct PyScopeHandle {
+        #[pyo3(get)]
+        id: u32,
+        #[pyo3(get)]
+        kind: String,
+        #[pyo3(get)]
+        parent_id: Option<u32>,
+        #[pyo3(get)]
+        node_id: Option<u32>,
+        #[pyo3(get)]
+        is_async: bool,
+        #[pyo3(get)]
+        uses_locals: bool,
+    }
+
+    impl PyScopeHandle {
+        fn new(scope_id: ScopeId, scope: &Scope<'_>) -> Self {
+            PyScopeHandle {
+                id: scope_id.as_u32(),
+                kind: scope_kind_name(&scope.kind).to_string(),
+                parent_id: scope.parent.map(|parent| parent.as_u32()),
+                node_id: scope_kind_node_id(&scope.kind),
+                is_async: scope_kind_is_async(&scope.kind),
+                uses_locals: scope.uses_locals(),
+            }
+        }
+    }
+
+    struct SemanticState {
+        checker: Cell<Option<*const Checker<'static>>>,
+    }
+
+    impl SemanticState {
+        fn new(checker: &Checker<'_>) -> Self {
+            Self {
+                checker: Cell::new(Some(
+                    checker as *const Checker<'_> as *const Checker<'static>,
+                )),
+            }
+        }
+
+        fn deactivate(&self) {
+            self.checker.set(None);
+        }
+
+        #[allow(unsafe_code)]
+        fn with_checker<R>(&self, f: impl FnOnce(&Checker<'_>) -> PyResult<R>) -> PyResult<R> {
+            let ptr = self.checker.get().ok_or_else(|| {
+                PyRuntimeError::new_err(
+                    "SemanticModel is no longer active; store results during the callback",
+                )
+            })?;
+            let checker = unsafe { &*(ptr as *const Checker<'_>) };
+            f(checker)
+        }
+    }
+
+    fn resolve_name_string(checker: &Checker<'_>, node_id: NodeId) -> Option<String> {
+        resolve_binding_id(checker, node_id).map(|binding_id| binding_name(checker, binding_id))
+    }
+
+    fn resolve_name_binding(checker: &Checker<'_>, node_id: NodeId) -> Option<PyBinding> {
+        resolve_binding_id(checker, node_id).map(|binding_id| PyBinding::new(checker, binding_id))
+    }
+
+    fn resolve_binding_id(checker: &Checker<'_>, node_id: NodeId) -> Option<BindingId> {
+        let semantic = checker.semantic();
+        let expr = semantic.node(node_id).as_expression()?;
+        let Expr::Name(name) = expr else {
+            return None;
+        };
+        semantic
+            .resolve_name(name)
+            .or_else(|| binding_id_for_store(checker, name))
+    }
+
+    fn binding_id_for_store(
+        checker: &Checker<'_>,
+        name: &ruff_python_ast::ExprName,
+    ) -> Option<BindingId> {
+        if matches!(name.ctx, ExprContext::Store) {
+            checker.semantic().current_scope().get(name.id.as_str())
+        } else {
+            None
+        }
+    }
+
+    fn binding_name(checker: &Checker<'_>, binding_id: BindingId) -> String {
+        checker
+            .semantic()
+            .binding(binding_id)
+            .name(checker.source())
+            .to_string()
+    }
+
+    fn binding_kind_name(kind: &BindingKind<'_>) -> &'static str {
+        match kind {
+            BindingKind::Annotation => "annotation",
+            BindingKind::Argument => "argument",
+            BindingKind::NamedExprAssignment => "named_expr_assignment",
+            BindingKind::Assignment => "assignment",
+            BindingKind::TypeParam => "type_param",
+            BindingKind::LoopVar => "loop_var",
+            BindingKind::WithItemVar => "with_item_var",
+            BindingKind::Global(_) => "global",
+            BindingKind::Nonlocal(..) => "nonlocal",
+            BindingKind::Builtin => "builtin",
+            BindingKind::ClassDefinition(_) => "class_definition",
+            BindingKind::FunctionDefinition(_) => "function_definition",
+            BindingKind::Export(_) => "export",
+            BindingKind::FutureImport => "future_import",
+            BindingKind::Import(_) => "import",
+            BindingKind::FromImport(_) => "from_import",
+            BindingKind::SubmoduleImport(_) => "submodule_import",
+            BindingKind::Deletion => "deletion",
+            BindingKind::ConditionalDeletion(_) => "conditional_deletion",
+            BindingKind::BoundException => "bound_exception",
+            BindingKind::UnboundException(_) => "unbound_exception",
+            BindingKind::DunderClassCell => "__class__",
+        }
+    }
+
+    fn scope_kind_name(kind: &ScopeKind<'_>) -> &'static str {
+        match kind {
+            ScopeKind::Module => "module",
+            ScopeKind::Class(_) => "class",
+            ScopeKind::Function(_) => "function",
+            ScopeKind::Lambda(_) => "lambda",
+            ScopeKind::Generator { kind, .. } => match kind {
+                GeneratorKind::Generator => "generator",
+                GeneratorKind::ListComprehension => "list_comprehension",
+                GeneratorKind::DictComprehension => "dict_comprehension",
+                GeneratorKind::SetComprehension => "set_comprehension",
+            },
+            ScopeKind::Type => "type",
+            ScopeKind::DunderClassCell => "dunder_class_cell",
+        }
+    }
+
+    fn scope_kind_is_async(kind: &ScopeKind<'_>) -> bool {
+        match kind {
+            ScopeKind::Function(stmt) => stmt.is_async,
+            ScopeKind::Generator { is_async, .. } => *is_async,
+            _ => false,
+        }
+    }
+
+    fn scope_kind_node_id(kind: &ScopeKind<'_>) -> Option<u32> {
+        match kind {
+            ScopeKind::Class(stmt) => stmt.node_index().load().as_u32(),
+            ScopeKind::Function(stmt) => stmt.node_index().load().as_u32(),
+            ScopeKind::Lambda(expr) => expr.node_index().load().as_u32(),
+            ScopeKind::Module
+            | ScopeKind::Generator { .. }
+            | ScopeKind::Type
+            | ScopeKind::DunderClassCell => None,
+        }
+    }
+
+    fn node_id(node: &Bound<'_, PyAny>) -> PyResult<NodeId> {
+        let handle = node_handle(node)?;
+        handle.store.semantic_index(handle.node_id)
+    }
+
+    fn module_from_name(name: &str) -> Option<Modules> {
+        match name {
+            "_typeshed" => Some(Modules::TYPESHED),
+            "anyio" => Some(Modules::ANYIO),
+            "builtins" => Some(Modules::BUILTINS),
+            "collections" => Some(Modules::COLLECTIONS),
+            "copy" => Some(Modules::COPY),
+            "contextvars" => Some(Modules::CONTEXTVARS),
+            "dataclasses" => Some(Modules::DATACLASSES),
+            "datetime" => Some(Modules::DATETIME),
+            "django" => Some(Modules::DJANGO),
+            "fastapi" => Some(Modules::FASTAPI),
+            "flask" => Some(Modules::FLASK),
+            "hashlib" => Some(Modules::HASHLIB),
+            "logging" => Some(Modules::LOGGING),
+            "markupsafe" => Some(Modules::MARKUPSAFE),
+            "mock" => Some(Modules::MOCK),
+            "numpy" => Some(Modules::NUMPY),
+            "os" => Some(Modules::OS),
+            "pandas" => Some(Modules::PANDAS),
+            "pytest" => Some(Modules::PYTEST),
+            "re" => Some(Modules::RE),
+            "regex" => Some(Modules::REGEX),
+            "six" => Some(Modules::SIX),
+            "subprocess" => Some(Modules::SUBPROCESS),
+            "tarfile" => Some(Modules::TARFILE),
+            "trio" => Some(Modules::TRIO),
+            "typing" => Some(Modules::TYPING),
+            "typing_extensions" => Some(Modules::TYPING_EXTENSIONS),
+            "attr" | "attrs" => Some(Modules::ATTRS),
+            "airflow" => Some(Modules::AIRFLOW),
+            "crypt" => Some(Modules::CRYPT),
+            _ => None,
         }
     }
 }

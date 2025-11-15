@@ -52,10 +52,11 @@ mod fallback {
 }
 
 #[cfg(feature = "ext-lint")]
-mod python;
+pub(crate) mod python;
 
 #[cfg(not(feature = "ext-lint"))]
 use fallback as imp;
+
 #[cfg(feature = "ext-lint")]
 use python as imp;
 

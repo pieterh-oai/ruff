@@ -3,9 +3,10 @@ use std::path::Path;
 use bitflags::bitflags;
 use rustc_hash::FxHashMap;
 
+use ruff_python_ast::NodeIndex;
 use ruff_python_ast::helpers::{from_relative_import, map_subscript};
 use ruff_python_ast::name::{QualifiedName, UnqualifiedName};
-use ruff_python_ast::{self as ast, Expr, ExprContext, PySourceType, Stmt};
+use ruff_python_ast::{self as ast, Expr, ExprContext, HasNodeIndex, PySourceType, Stmt};
 use ruff_text_size::{Ranged, TextRange, TextSize};
 
 use crate::Imported;
@@ -935,6 +936,13 @@ impl<'a> SemanticModel<'a> {
         self.resolved_names.get(&name.into()).copied()
     }
 
+    /// Return an iterator over all resolved name bindings.
+    pub fn resolved_name_bindings(&self) -> impl Iterator<Item = (TextSize, BindingId)> + '_ {
+        self.resolved_names
+            .iter()
+            .map(|(name_id, binding_id)| (name_id.as_text_size(), *binding_id))
+    }
+
     /// Resolves the [`ast::ExprName`] to the [`BindingId`] of the symbol it refers to, if it's the
     /// only binding to that name in its scope.
     pub fn only_binding(&self, name: &ast::ExprName) -> Option<BindingId> {
@@ -1196,7 +1204,10 @@ impl<'a> SemanticModel<'a> {
 
     /// Push an AST node [`NodeRef`] onto the stack.
     pub fn push_node<T: Into<NodeRef<'a>>>(&mut self, node: T) {
-        self.node_id = Some(self.nodes.insert(node.into(), self.node_id, self.branch_id));
+        let node_ref: NodeRef<'a> = node.into();
+        let node_id = self.nodes.insert(node_ref, self.node_id, self.branch_id);
+        set_node_index(node_ref, node_id);
+        self.node_id = Some(node_id);
     }
 
     /// Pop the current AST node [`NodeRef`] off the stack.
@@ -2793,11 +2804,25 @@ impl Ranged for ImportedName {
 
 /// A unique identifier for an [`ast::ExprName`]. No two names can even appear at the same location
 /// in the source code, so the starting offset is a cheap and sufficient unique identifier.
-#[derive(Debug, Hash, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 struct NameId(TextSize);
 
 impl From<&ast::ExprName> for NameId {
     fn from(name: &ast::ExprName) -> Self {
         Self(name.start())
+    }
+}
+
+impl NameId {
+    const fn as_text_size(self) -> TextSize {
+        self.0
+    }
+}
+
+fn set_node_index(node: NodeRef<'_>, node_id: NodeId) {
+    let index = NodeIndex::from(u32::from(node_id));
+    match node {
+        NodeRef::Stmt(stmt) => stmt.node_index().set(index),
+        NodeRef::Expr(expr) => expr.node_index().set(index),
     }
 }
