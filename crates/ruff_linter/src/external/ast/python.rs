@@ -6,9 +6,11 @@ use self::projection::{ProjectionMode, project_typed_node};
 use self::store::{AstStoreHandle, current_store};
 use crate::Locator;
 use crate::external::ast::target::{ExprKind, StmtKind};
+use crate::external::runtime::python::semantic::{self, SemanticModelView};
 use pyo3::IntoPyObject;
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyDict, PyModule, PyString, PyTuple};
+use pyo3::types::{PyAnyMethods, PyBool, PyDict, PyModule, PyString, PyTuple};
 use pyo3::{Bound, PyClassInitializer, PyObject};
 use ruff_python_ast::name::UnqualifiedName;
 use ruff_python_ast::{AnyNodeRef, Expr, ExprCall, HasNodeIndex, Stmt};
@@ -28,6 +30,23 @@ pub(crate) struct ProjectionTypes;
 pub(crate) static PROJECTION_TYPES: ProjectionTypes = ProjectionTypes;
 
 pub(crate) type ProjectionTypesRef = &'static ProjectionTypes;
+
+#[derive(Clone)]
+pub(crate) struct AstNodeHandle {
+    pub(crate) node_id: u32,
+    pub(crate) store: AstStoreHandle,
+}
+
+pub(crate) fn node_handle(node: &Bound<'_, PyAny>) -> PyResult<AstNodeHandle> {
+    let node = node
+        .downcast::<bindings::Node>()
+        .map_err(|_| PyValueError::new_err("expected ruff_external.Node"))?;
+    let node = node.borrow();
+    Ok(AstNodeHandle {
+        node_id: node.node_id(),
+        store: node.store().clone(),
+    })
+}
 
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -63,7 +82,7 @@ pub(crate) fn expr_to_python(
 ) -> PyResult<PyObject> {
     project_or_raw(py, locator, AnyNodeRef::from(expr), types, || {
         let store = current_store();
-        let node_id = ensure_node_id(expr, &store);
+        let node_id = store.ensure(expr);
         let kind = ExprKind::from(expr).as_str().to_string();
         let range = expr.range();
         let text = locator.slice(range);
@@ -80,7 +99,7 @@ pub(crate) fn stmt_to_python(
 ) -> PyResult<PyObject> {
     project_or_raw(py, locator, AnyNodeRef::from(stmt), types, || {
         let store = current_store();
-        let node_id = ensure_node_id(stmt, &store);
+        let node_id = store.ensure(stmt);
         let kind = StmtKind::from(stmt).as_str().to_string();
         let range = stmt.range();
         let text = locator.slice(range);
@@ -164,7 +183,7 @@ fn py_none(py: Python<'_>) -> PyObject {
 }
 
 fn ensure_node_id(node: &impl HasNodeIndex, store: &AstStoreHandle) -> u32 {
-    store.assign_id(node.node_index())
+    store.ensure_id_for_semantic_index(node.node_index())
 }
 
 fn extract_callee(locator: &Locator<'_>, range: TextRange, call: &ExprCall) -> Option<String> {
@@ -186,8 +205,20 @@ pub(crate) fn ruff_external(_py: Python<'_>, module: &Bound<'_, PyModule>) -> Py
     module.add_class::<bindings::Node>()?;
     module.add_class::<RawNode>()?;
     module.add_class::<bindings::Context>()?;
+    module.add_class::<SemanticModelView>()?;
+    module.add_class::<semantic::PyBinding>()?;
+    module.add_class::<semantic::PyReference>()?;
+    module.add_class::<semantic::PyScopeHandle>()?;
     generated::add_generated_classes(module)?;
-    let mut exports = vec!["Context", "Node", "RawNode"];
+    let mut exports = vec![
+        "Context",
+        "Node",
+        "RawNode",
+        "SemanticModel",
+        "Binding",
+        "Reference",
+        "ScopeHandle",
+    ];
     exports.extend_from_slice(GENERATED_EXPORTS);
     let exports = PyTuple::new(module.py(), exports)?;
     module.add("__all__", exports)?;
@@ -343,17 +374,26 @@ mod bindings {
         #[pyo3(get)]
         config: PyObject,
         #[pyo3(get)]
+        semantic: PyObject,
+        #[pyo3(get)]
         _report: Py<PyAny>,
     }
 
     #[pymethods]
     impl Context {
         #[new]
-        fn new(code: String, name: String, config: PyObject, reporter: Py<PyAny>) -> Self {
+        fn new(
+            code: String,
+            name: String,
+            config: PyObject,
+            reporter: Py<PyAny>,
+            semantic: PyObject,
+        ) -> Self {
             Self {
                 code,
                 name,
                 config,
+                semantic,
                 _report: reporter,
             }
         }
@@ -572,6 +612,55 @@ mod tests {
                 Ok(())
             },
         )
+    }
+
+    #[test]
+    fn parameters_get_unique_ids_after_reprojection() -> anyhow::Result<()> {
+        pyo3::prepare_freethreaded_python();
+        let source = "def func(x):\n    pass\n";
+        let parsed = parse_module(source)?;
+        let module = parsed.into_syntax();
+        let stmt = module
+            .body
+            .first()
+            .ok_or_else(|| anyhow!("missing statement"))?;
+        let Stmt::FunctionDef(_) = stmt else {
+            return Err(anyhow!("expected FunctionDef"));
+        };
+
+        let locator = Locator::new(source);
+        let source_file = SourceFileBuilder::new("test.py", source).finish();
+        Python::with_gil(|py| {
+            let module_types = load_module_types(py)?;
+
+            // First pass: assign an ID to the function but leave its parameters untouched.
+            with_store(AstStoreHandle::new(), || {
+                with_source_file(&source_file, || {
+                    let node =
+                        stmt_to_python(py, &locator, stmt, module_types.projection).expect("stmt");
+                    let bound = node.bind(py);
+                    let _: u32 = bound
+                        .getattr("node_id")
+                        .expect("function node_id")
+                        .extract()
+                        .expect("node_id as u32");
+                });
+            });
+
+            // Second pass: ensure parameters receive a distinct ID in the new store.
+            with_store(AstStoreHandle::new(), || {
+                with_source_file(&source_file, || -> anyhow::Result<()> {
+                    let node = stmt_to_python(py, &locator, stmt, module_types.projection)?;
+                    let bound = node.bind(py);
+                    let func_id: u32 = bound.getattr("node_id")?.extract()?;
+                    let params = bound.getattr("parameters")?;
+                    let params_id: u32 = params.getattr("node_id")?.extract()?;
+
+                    assert_ne!(func_id, params_id);
+                    Ok(())
+                })
+            })
+        })
     }
 
     #[test]

@@ -3,9 +3,10 @@ use std::path::Path;
 use bitflags::bitflags;
 use rustc_hash::FxHashMap;
 
+use ruff_python_ast::NodeIndex;
 use ruff_python_ast::helpers::{from_relative_import, map_subscript};
 use ruff_python_ast::name::{QualifiedName, UnqualifiedName};
-use ruff_python_ast::{self as ast, Expr, ExprContext, PySourceType, Stmt};
+use ruff_python_ast::{self as ast, Expr, ExprContext, HasNodeIndex, PySourceType, Stmt};
 use ruff_text_size::{Ranged, TextRange, TextSize};
 
 use crate::Imported;
@@ -935,6 +936,13 @@ impl<'a> SemanticModel<'a> {
         self.resolved_names.get(&name.into()).copied()
     }
 
+    /// Return an iterator over all resolved name bindings.
+    pub fn resolved_name_bindings(&self) -> impl Iterator<Item = (TextSize, BindingId)> + '_ {
+        self.resolved_names
+            .iter()
+            .map(|(name_id, binding_id)| (name_id.0, *binding_id))
+    }
+
     /// Resolves the [`ast::ExprName`] to the [`BindingId`] of the symbol it refers to, if it's the
     /// only binding to that name in its scope.
     pub fn only_binding(&self, name: &ast::ExprName) -> Option<BindingId> {
@@ -1196,7 +1204,10 @@ impl<'a> SemanticModel<'a> {
 
     /// Push an AST node [`NodeRef`] onto the stack.
     pub fn push_node<T: Into<NodeRef<'a>>>(&mut self, node: T) {
-        self.node_id = Some(self.nodes.insert(node.into(), self.node_id, self.branch_id));
+        let node_ref: NodeRef<'a> = node.into();
+        let node_id = self.nodes.insert(node_ref, self.node_id, self.branch_id);
+        set_node_index(node_ref, node_id);
+        self.node_id = Some(node_id);
     }
 
     /// Pop the current AST node [`NodeRef`] off the stack.
@@ -1419,6 +1430,12 @@ impl<'a> SemanticModel<'a> {
         self.nodes
             .ancestor_ids(node_id)
             .filter_map(move |id| self.nodes[id].as_statement())
+    }
+
+    /// Return `true` if the given [`NodeId`] has been assigned in this semantic model.
+    #[inline]
+    pub fn contains_node(&self, node_id: NodeId) -> bool {
+        node_id.index() < self.nodes.len()
     }
 
     /// Given a [`Stmt`], return its parent, if any.
@@ -2799,5 +2816,13 @@ struct NameId(TextSize);
 impl From<&ast::ExprName> for NameId {
     fn from(name: &ast::ExprName) -> Self {
         Self(name.start())
+    }
+}
+
+fn set_node_index(node: NodeRef<'_>, node_id: NodeId) {
+    let index = NodeIndex::from(u32::from(node_id));
+    match node {
+        NodeRef::Stmt(stmt) => stmt.node_index().set(index),
+        NodeRef::Expr(expr) => expr.node_index().set(index),
     }
 }
