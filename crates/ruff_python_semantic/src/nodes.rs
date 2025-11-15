@@ -63,6 +63,11 @@ impl<'a> Nodes<'a> {
     pub(crate) fn ancestor_ids(&self, node_id: NodeId) -> impl Iterator<Item = NodeId> + '_ {
         std::iter::successors(Some(node_id), |&node_id| self.nodes[node_id].parent)
     }
+
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.nodes.len()
+    }
 }
 
 impl<'a> Index<NodeId> for Nodes<'a> {

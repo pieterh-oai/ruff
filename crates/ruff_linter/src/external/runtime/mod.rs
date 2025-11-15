@@ -30,10 +30,21 @@ mod fallback {
         }
 
         #[allow(clippy::unused_self)]
-        pub(crate) fn run_on_stmt(&self, _checker: &Checker<'_>, _stmt: &Stmt) {}
+        pub(crate) fn run_on_stmt(&self, _checker: &mut Checker<'_>, _stmt: &Stmt) {}
 
         #[allow(clippy::unused_self)]
-        pub(crate) fn run_on_expr(&self, _checker: &Checker<'_>, _expr: &Expr) {}
+        pub(crate) fn run_on_expr(&self, _checker: &mut Checker<'_>, _expr: &Expr) {}
+
+        #[allow(clippy::unused_self)]
+        pub(crate) fn run_on_function_def_deferred(
+            &self,
+            _checker: &mut Checker<'_>,
+            _stmt: &Stmt,
+        ) {
+        }
+
+        #[allow(clippy::unused_self)]
+        pub(crate) fn run_on_lambda_deferred(&self, _checker: &mut Checker<'_>, _expr: &Expr) {}
 
         #[allow(clippy::unused_self)]
         pub(crate) fn run_in_session<F, R>(&self, f: F) -> R
@@ -52,10 +63,11 @@ mod fallback {
 }
 
 #[cfg(feature = "ext-lint")]
-mod python;
+pub(crate) mod python;
 
 #[cfg(not(feature = "ext-lint"))]
 use fallback as imp;
+
 #[cfg(feature = "ext-lint")]
 use python as imp;
 
@@ -80,13 +92,23 @@ impl ExternalLintRuntimeHandle {
     }
 
     #[cfg_attr(not(feature = "ext-lint"), allow(dead_code))]
-    pub(crate) fn run_on_stmt(&self, checker: &Checker<'_>, stmt: &Stmt) {
+    pub(crate) fn run_on_stmt(&self, checker: &mut Checker<'_>, stmt: &Stmt) {
         self.runtime.run_on_stmt(checker, stmt);
     }
 
     #[cfg_attr(not(feature = "ext-lint"), allow(dead_code))]
-    pub(crate) fn run_on_expr(&self, checker: &Checker<'_>, expr: &Expr) {
+    pub(crate) fn run_on_expr(&self, checker: &mut Checker<'_>, expr: &Expr) {
         self.runtime.run_on_expr(checker, expr);
+    }
+
+    #[cfg_attr(not(feature = "ext-lint"), allow(dead_code))]
+    pub(crate) fn run_on_function_def_deferred(&self, checker: &mut Checker<'_>, stmt: &Stmt) {
+        self.runtime.run_on_function_def_deferred(checker, stmt);
+    }
+
+    #[cfg_attr(not(feature = "ext-lint"), allow(dead_code))]
+    pub(crate) fn run_on_lambda_deferred(&self, checker: &mut Checker<'_>, expr: &Expr) {
+        self.runtime.run_on_lambda_deferred(checker, expr);
     }
 
     pub(crate) fn run_in_session<F, R>(&self, f: F) -> R

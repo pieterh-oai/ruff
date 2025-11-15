@@ -535,6 +535,12 @@ impl<'a> Checker<'a> {
         &self.semantic
     }
 
+    /// The mutable [`SemanticModel`], built up over the course of the AST traversal.
+    #[cfg(feature = "ext-lint")]
+    pub(crate) const fn semantic_mut(&mut self) -> &mut SemanticModel<'a> {
+        &mut self.semantic
+    }
+
     /// The [`LinterSettings`] for the current analysis, including the enabled rules.
     pub(crate) const fn settings(&self) -> &'a LinterSettings {
         self.context.settings
@@ -1663,7 +1669,9 @@ impl<'a> Visitor<'a> for Checker<'a> {
 
         // Step 4: Analysis
         analyze::statement(stmt, self);
-        if let Some(runtime) = &self.external_runtime {
+        if let Some(runtime) = self.external_runtime.clone() {
+            #[cfg(feature = "ext-lint")]
+            self.semantic.record_current_node_snapshot();
             runtime.run_on_stmt(self, stmt);
         }
 
@@ -2286,7 +2294,9 @@ impl<'a> Visitor<'a> for Checker<'a> {
 
         self.semantic.flags = flags_snapshot;
         analyze::expression(expr, self);
-        if let Some(runtime) = &self.external_runtime {
+        if let Some(runtime) = self.external_runtime.clone() {
+            #[cfg(feature = "ext-lint")]
+            self.semantic.record_current_node_snapshot();
             runtime.run_on_expr(self, expr);
         }
         self.semantic.pop_node();
@@ -3186,6 +3196,12 @@ impl<'a> Checker<'a> {
                 // Set the docstring state before visiting the function body.
                 self.docstring_state = DocstringState::Expected(ExpectedDocstringKind::Function);
                 self.visit_body(body);
+
+                if let Some(runtime) = self.external_runtime.clone() {
+                    #[cfg(feature = "ext-lint")]
+                    self.semantic.record_current_node_snapshot();
+                    runtime.run_on_function_def_deferred(self, stmt);
+                }
             }
         }
         self.semantic.restore(snapshot);
@@ -3201,12 +3217,14 @@ impl<'a> Checker<'a> {
             for snapshot in lambdas {
                 self.semantic.restore(snapshot);
 
-                let Some(Expr::Lambda(ast::ExprLambda {
-                    parameters,
-                    body,
-                    range: _,
-                    node_index: _,
-                })) = self.semantic.current_expression()
+                let Some(
+                    lambda_expr @ Expr::Lambda(ast::ExprLambda {
+                        parameters,
+                        body,
+                        range: _,
+                        node_index: _,
+                    }),
+                ) = self.semantic.current_expression()
                 else {
                     unreachable!("Expected Expr::Lambda");
                 };
@@ -3242,6 +3260,12 @@ impl<'a> Checker<'a> {
                 // Pop the DunderClassCell scope if it was added
                 if added_dunder_class_scope {
                     self.semantic.pop_scope();
+                }
+
+                if let Some(runtime) = self.external_runtime.clone() {
+                    #[cfg(feature = "ext-lint")]
+                    self.semantic.record_current_node_snapshot();
+                    runtime.run_on_lambda_deferred(self, lambda_expr);
                 }
             }
         }
