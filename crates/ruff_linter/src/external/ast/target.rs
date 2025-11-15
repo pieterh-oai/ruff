@@ -10,6 +10,7 @@ use thiserror::Error;
 pub enum AstTarget {
     Stmt(StmtKind),
     Expr(ExprKind),
+    // Statement kinds that are dispatched during deferred passes (e.g., after function bodies are visited).
 }
 
 impl AstTarget {
@@ -71,6 +72,7 @@ pub enum AstNodeClass {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum StmtKind {
     FunctionDef,
+    FunctionDefDeferred,
     ClassDef,
     Return,
     Delete,
@@ -101,6 +103,7 @@ impl StmtKind {
     pub const fn as_str(self) -> &'static str {
         match self {
             StmtKind::FunctionDef => "FunctionDef",
+            StmtKind::FunctionDefDeferred => "FunctionDefDeferred",
             StmtKind::ClassDef => "ClassDef",
             StmtKind::Return => "Return",
             StmtKind::Delete => "Delete",
@@ -129,34 +132,35 @@ impl StmtKind {
     }
 
     pub fn matches(self, stmt: &Stmt) -> bool {
-        matches!(
-            (self, stmt),
-            (StmtKind::FunctionDef, Stmt::FunctionDef(_))
-                | (StmtKind::ClassDef, Stmt::ClassDef(_))
-                | (StmtKind::Return, Stmt::Return(_))
-                | (StmtKind::Delete, Stmt::Delete(_))
-                | (StmtKind::TypeAlias, Stmt::TypeAlias(_))
-                | (StmtKind::Assign, Stmt::Assign(_))
-                | (StmtKind::AugAssign, Stmt::AugAssign(_))
-                | (StmtKind::AnnAssign, Stmt::AnnAssign(_))
-                | (StmtKind::For, Stmt::For(_))
-                | (StmtKind::While, Stmt::While(_))
-                | (StmtKind::If, Stmt::If(_))
-                | (StmtKind::With, Stmt::With(_))
-                | (StmtKind::Match, Stmt::Match(_))
-                | (StmtKind::Raise, Stmt::Raise(_))
-                | (StmtKind::Try, Stmt::Try(_))
-                | (StmtKind::Assert, Stmt::Assert(_))
-                | (StmtKind::Import, Stmt::Import(_))
-                | (StmtKind::ImportFrom, Stmt::ImportFrom(_))
-                | (StmtKind::Global, Stmt::Global(_))
-                | (StmtKind::Nonlocal, Stmt::Nonlocal(_))
-                | (StmtKind::Expr, Stmt::Expr(_))
-                | (StmtKind::Pass, Stmt::Pass(_))
-                | (StmtKind::Break, Stmt::Break(_))
-                | (StmtKind::Continue, Stmt::Continue(_))
-                | (StmtKind::IpyEscapeCommand, Stmt::IpyEscapeCommand(_))
-        )
+        match self {
+            StmtKind::FunctionDef | StmtKind::FunctionDefDeferred => {
+                matches!(stmt, Stmt::FunctionDef(_))
+            }
+            StmtKind::ClassDef => matches!(stmt, Stmt::ClassDef(_)),
+            StmtKind::Return => matches!(stmt, Stmt::Return(_)),
+            StmtKind::Delete => matches!(stmt, Stmt::Delete(_)),
+            StmtKind::TypeAlias => matches!(stmt, Stmt::TypeAlias(_)),
+            StmtKind::Assign => matches!(stmt, Stmt::Assign(_)),
+            StmtKind::AugAssign => matches!(stmt, Stmt::AugAssign(_)),
+            StmtKind::AnnAssign => matches!(stmt, Stmt::AnnAssign(_)),
+            StmtKind::For => matches!(stmt, Stmt::For(_)),
+            StmtKind::While => matches!(stmt, Stmt::While(_)),
+            StmtKind::If => matches!(stmt, Stmt::If(_)),
+            StmtKind::With => matches!(stmt, Stmt::With(_)),
+            StmtKind::Match => matches!(stmt, Stmt::Match(_)),
+            StmtKind::Raise => matches!(stmt, Stmt::Raise(_)),
+            StmtKind::Try => matches!(stmt, Stmt::Try(_)),
+            StmtKind::Assert => matches!(stmt, Stmt::Assert(_)),
+            StmtKind::Import => matches!(stmt, Stmt::Import(_)),
+            StmtKind::ImportFrom => matches!(stmt, Stmt::ImportFrom(_)),
+            StmtKind::Global => matches!(stmt, Stmt::Global(_)),
+            StmtKind::Nonlocal => matches!(stmt, Stmt::Nonlocal(_)),
+            StmtKind::Expr => matches!(stmt, Stmt::Expr(_)),
+            StmtKind::Pass => matches!(stmt, Stmt::Pass(_)),
+            StmtKind::Break => matches!(stmt, Stmt::Break(_)),
+            StmtKind::Continue => matches!(stmt, Stmt::Continue(_)),
+            StmtKind::IpyEscapeCommand => matches!(stmt, Stmt::IpyEscapeCommand(_)),
+        }
     }
 }
 
@@ -218,6 +222,7 @@ pub enum ExprKind {
     If,
     IpyEscapeCommand,
     Lambda,
+    LambdaDeferred,
     List,
     ListComp,
     Name,
@@ -256,6 +261,7 @@ impl ExprKind {
             ExprKind::If => "If",
             ExprKind::IpyEscapeCommand => "IpyEscapeCommand",
             ExprKind::Lambda => "Lambda",
+            ExprKind::LambdaDeferred => "LambdaDeferred",
             ExprKind::List => "List",
             ExprKind::ListComp => "ListComp",
             ExprKind::Name => "Name",
@@ -294,6 +300,7 @@ impl ExprKind {
             ExprKind::If => matches!(expr, Expr::If(_)),
             ExprKind::IpyEscapeCommand => matches!(expr, Expr::IpyEscapeCommand(_)),
             ExprKind::Lambda => matches!(expr, Expr::Lambda(_)),
+            ExprKind::LambdaDeferred => matches!(expr, Expr::Lambda(_)),
             ExprKind::List => matches!(expr, Expr::List(_)),
             ExprKind::ListComp => matches!(expr, Expr::ListComp(_)),
             ExprKind::Name => matches!(expr, Expr::Name(_)),
@@ -384,6 +391,7 @@ fn parse_target(raw: &str) -> Result<AstTarget, AstTargetParseError> {
 fn parse_stmt_kind(name: &str) -> Result<StmtKind, AstTargetParseError> {
     match name {
         "FunctionDef" => Ok(StmtKind::FunctionDef),
+        "FunctionDefDeferred" => Ok(StmtKind::FunctionDefDeferred),
         "ClassDef" => Ok(StmtKind::ClassDef),
         "Return" => Ok(StmtKind::Return),
         "Delete" => Ok(StmtKind::Delete),
@@ -430,6 +438,7 @@ fn parse_expr_kind(name: &str) -> Result<ExprKind, AstTargetParseError> {
         "If" => Ok(ExprKind::If),
         "IpyEscapeCommand" => Ok(ExprKind::IpyEscapeCommand),
         "Lambda" => Ok(ExprKind::Lambda),
+        "LambdaDeferred" => Ok(ExprKind::LambdaDeferred),
         "List" => Ok(ExprKind::List),
         "ListComp" => Ok(ExprKind::ListComp),
         "Name" => Ok(ExprKind::Name),
@@ -443,7 +452,7 @@ fn parse_expr_kind(name: &str) -> Result<ExprKind, AstTargetParseError> {
         "StringLiteral" => Ok(ExprKind::StringLiteral),
         "Subscript" => Ok(ExprKind::Subscript),
         "Tuple" => Ok(ExprKind::Tuple),
-        "TString" => Ok(ExprKind::FString),
+        "TString" => Ok(ExprKind::TString),
         "UnaryOp" => Ok(ExprKind::UnaryOp),
         "Yield" => Ok(ExprKind::Yield),
         "YieldFrom" => Ok(ExprKind::YieldFrom),

@@ -3083,6 +3083,10 @@ impl<'a> Checker<'a> {
                 // Set the docstring state before visiting the function body.
                 self.docstring_state = DocstringState::Expected(ExpectedDocstringKind::Function);
                 self.visit_body(body);
+
+                if let Some(runtime) = &self.external_runtime {
+                    runtime.run_on_function_def_deferred(self, stmt);
+                }
             }
         }
         self.semantic.restore(snapshot);
@@ -3098,12 +3102,14 @@ impl<'a> Checker<'a> {
             for snapshot in lambdas {
                 self.semantic.restore(snapshot);
 
-                let Some(Expr::Lambda(ast::ExprLambda {
-                    parameters,
-                    body,
-                    range: _,
-                    node_index: _,
-                })) = self.semantic.current_expression()
+                let Some(
+                    lambda_expr @ Expr::Lambda(ast::ExprLambda {
+                        parameters,
+                        body,
+                        range: _,
+                        node_index: _,
+                    }),
+                ) = self.semantic.current_expression()
                 else {
                     unreachable!("Expected Expr::Lambda");
                 };
@@ -3139,6 +3145,10 @@ impl<'a> Checker<'a> {
                 // Pop the DunderClassCell scope if it was added
                 if added_dunder_class_scope {
                     self.semantic.pop_scope();
+                }
+
+                if let Some(runtime) = &self.external_runtime {
+                    runtime.run_on_lambda_deferred(self, lambda_expr);
                 }
             }
         }

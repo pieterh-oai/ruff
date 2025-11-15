@@ -11,7 +11,7 @@ use itertools::Itertools;
 use rustc_hash::FxHashMap;
 
 use ruff_db::diagnostic::{
-    Diagnostic, DiagnosticFormat, DisplayDiagnosticConfig, DisplayDiagnostics, Span,
+    Diagnostic, DiagnosticFormat, DiagnosticId, DisplayDiagnosticConfig, DisplayDiagnostics, Span,
 };
 use ruff_notebook::Notebook;
 #[cfg(not(fuzzing))]
@@ -350,7 +350,15 @@ Source with applied fixes:
         .into_iter()
         .filter_map(|msg| Some((msg.secondary_code()?.to_string(), msg)))
         .map(|(code, mut diagnostic)| {
-            let rule = Rule::from_code(&code).unwrap();
+            let rule = match Rule::from_code(&code) {
+                Ok(rule) => rule,
+                Err(_) => match diagnostic.id() {
+                    DiagnosticId::Lint(lint_name) if lint_name == Rule::ExternalLinter.name() => {
+                        Rule::ExternalLinter
+                    }
+                    _ => panic!("Unknown rule code: {code}"),
+                },
+            };
             let fixable = diagnostic.fix().is_some_and(|fix| {
                 matches!(
                     fix.applicability(),
